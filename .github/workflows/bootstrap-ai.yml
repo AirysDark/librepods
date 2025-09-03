@@ -1,0 +1,39 @@
+name: AI Autobuilder — Bootstrap (multi-purpose)
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  bootstrap:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install deps
+        run: pip install requests pyyaml
+
+      - name: Generate workflows + autobuilder script
+        run: python3 tools/ai_bootstrapper.py
+
+      - name: Create PR with generated workflows
+        uses: peter-evans/create-pull-request@v6
+        with:
+          branch: ai/autobuilder-bootstrap
+          title: "AI Autobuilder: bootstrap (multi-purpose)"
+          commit-message: "chore: generate AI autobuilder workflows + script (multi-purpose)"
+          body: |
+            This PR was created by the bootstrap workflow.
+            - Detects project type (android / cmake / node / python / unknown)
+            - Generates a matching CI workflow with build capture
+            - Adds AI autobuilder (OpenAI → llama fallback) and TinyLlama GGUF fetch
+          labels: automation, ci

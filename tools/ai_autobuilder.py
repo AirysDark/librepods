@@ -1,9 +1,13 @@
 #!/usr/bin/env python3
 import os, sys, subprocess, json, tempfile, re, pathlib, requests
 
-PROVIDER = os.getenv("PROVIDER", "openai")  # default OpenAI for BlueLibre
-# Use a widely available model by default; can override via repo variable OPENAI_MODEL
+PROVIDER = os.getenv("PROVIDER", "openai")  # default to OpenAI
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+# Fallback settings
+FALLBACK_PROVIDER = os.getenv("FALLBACK_PROVIDER", "llama")
+LLAMA_CPP_BIN = os.getenv("LLAMA_CPP_BIN", "llama-cli")
+LLAMA_MODEL_PATH = os.getenv("MODEL_PATH", "models/Meta-Llama-3-8B-Instruct.Q4_K_M.gguf")
+
 MAX_ATTEMPTS = int(os.getenv("AI_BUILDER_ATTEMPTS", "3"))
 BUILD_CMD = os.getenv("BUILD_CMD", "./gradlew assembleDebug --stacktrace")
 PROJECT_ROOT = pathlib.Path(os.getenv("PROJECT_ROOT", ".")).resolve()
@@ -26,7 +30,7 @@ Build log tail (last 400 lines):
 Constraints:
 - Return ONLY a valid unified diff starting with ---/+++ and @@ hunks.
 - Keep edits minimal and safe.
-- If Gradle/Android config changes are needed (e.g., build.gradle, settings.gradle, gradle.properties, AndroidManifest.xml), include them in the diff.
+- If build config changes are needed (e.g., Gradle/CMake), include them in the diff.
 - Prefer updating deprecated APIs or SDK versions if that's the cause.
 - Do NOT modify unrelated files.
 
@@ -71,7 +75,7 @@ def run_build():
             f.write(line)
     return p.wait()
 
-def call_llm(prompt):
+def _call_openai(prompt):
     key = os.environ["OPENAI_API_KEY"]
     url = "https://api.openai.com/v1/chat/completions"
     payload = {
@@ -93,10 +97,31 @@ def call_llm(prompt):
         except Exception:
             err = {"raw": r.text}
         print("OpenAI API error:", json.dumps(err, indent=2))
-        r.raise_for_status()
-
+        raise RuntimeError(f"openai_error:{json.dumps(err)}")
     data = r.json()
     return data["choices"][0]["message"]["content"]
+
+def _call_llama(prompt):
+    cmd = f'{LLAMA_CPP_BIN} -m "{LLAMA_MODEL_PATH}" -p {json.dumps(prompt)} -n 2048 --temp 0.2'
+    out = subprocess.run(cmd, shell=True, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+    if out.returncode != 0:
+        print("llama.cpp error output:\n", out.stdout)
+        raise RuntimeError("llama_failed")
+    return out.stdout
+
+def call_llm(prompt):
+    if PROVIDER == "openai":
+        try:
+            return _call_openai(prompt)
+        except RuntimeError as e:
+            if "openai_error" in str(e) and FALLBACK_PROVIDER == "llama":
+                print("⚠️ OpenAI failed (quota or request). Falling back to llama.cpp…")
+                return _call_llama(prompt)
+            raise
+    elif PROVIDER == "llama":
+        return _call_llama(prompt)
+    else:
+        raise RuntimeError(f"Unknown PROVIDER={PROVIDER}")
 
 def extract_unified_diff(text):
     m = re.search(r'(?ms)^--- [^\n]+\n\+\+\+ [^\n]+\n', text)
@@ -123,8 +148,9 @@ def apply_patch(diff_text):
         os.unlink(tmp.name)
 
 def main():
-    print("== AI Autobuilder: BlueLibre preset ==")
+    print("== AI Autobuilder (with OpenAI→llama fallback) ==")
     print("Project:", PROJECT_ROOT)
+    print(f"Provider: {PROVIDER}, Model: {OPENAI_MODEL}, Fallback: {FALLBACK_PROVIDER}")
     if not (PROJECT_ROOT / ".git").exists():
         run("git init")
         run('git config user.name "ai-autobuilder"')
@@ -134,7 +160,7 @@ def main():
 
     code = run_build()
     if code == 0:
-        print("? Build already succeeds. Nothing to do.")
+        print("✅ Build already succeeds. Nothing to do.")
         return 0
 
     attempts = 0
@@ -163,10 +189,10 @@ def main():
 
         code = run_build()
         if code == 0:
-            print("? Build fixed!")
+            print("✅ Build fixed!")
             return 0
 
-    print("? Still failing after attempts.")
+    print("❌ Still failing after attempts.")
     print("Check build.log and .pre_ai_fix.patch to revert:  git apply -R .pre_ai_fix.patch")
     return 1
 
